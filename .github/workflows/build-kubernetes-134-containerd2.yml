@@ -100,20 +100,21 @@ jobs:
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          container=$(buildah from "$LOCAL_IMAGE")
-          trap 'buildah umount "$container" >/dev/null 2>&1 || :; buildah rm "$container" >/dev/null 2>&1 || :' EXIT
-          mnt=$(buildah mount "$container")
-          grep -qx 'version = 4' "$mnt/etc/config.toml.tmpl"
-          grep -q 'registry.k8s.io/pause:3.10.1' "$mnt/images/shim/DefaultImageList"
-          test -x "$mnt/opt/sealctl" && test -x "$mnt/cri/image-cri-shim"
-          tar -xOzf "$mnt/cri/cri-containerd.tar.gz" usr/bin/containerd > "$RUNNER_TEMP/target-containerd"
+          # kubernetes.sh creates the image in rootful buildah storage.
+          container=$(sudo buildah from "$LOCAL_IMAGE")
+          trap 'sudo buildah umount "$container" >/dev/null 2>&1 || :; sudo buildah rm "$container" >/dev/null 2>&1 || :' EXIT
+          mnt=$(sudo buildah mount "$container")
+          sudo grep -qx 'version = 4' "$mnt/etc/config.toml.tmpl"
+          sudo grep -q 'registry.k8s.io/pause:3.10.1' "$mnt/images/shim/DefaultImageList"
+          sudo test -x "$mnt/opt/sealctl" && sudo test -x "$mnt/cri/image-cri-shim"
+          sudo tar -xOzf "$mnt/cri/cri-containerd.tar.gz" usr/bin/containerd > "$RUNNER_TEMP/target-containerd"
           if [[ "$TARGET_ARCH" == amd64 ]]; then
             chmod +x "$RUNNER_TEMP/target-containerd"
             "$RUNNER_TEMP/target-containerd" --version | grep -F 'v2.4.1'
-            test "$("$mnt/bin/kubeadm" version -o short)" = v1.34.12
-            test "$("$mnt/bin/kubelet" --version)" = 'Kubernetes v1.34.12'
+            test "$(sudo "$mnt/bin/kubeadm" version -o short)" = v1.34.12
+            test "$(sudo "$mnt/bin/kubelet" --version)" = 'Kubernetes v1.34.12'
           else
-            file "$RUNNER_TEMP/target-containerd" "$mnt/bin/kubeadm" | grep -c 'ARM aarch64' | grep -qx 2
+            sudo file "$RUNNER_TEMP/target-containerd" "$mnt/bin/kubeadm" | grep -c 'ARM aarch64' | grep -qx 2
           fi
       - name: Push architecture tag to Docker Hub (explicit opt-in only)
         if: github.event_name == 'workflow_dispatch' && inputs.publish == true
@@ -129,8 +130,8 @@ jobs:
           [[ "$DOCKERHUB_REPOSITORY" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]]
           test -n "$DOCKERHUB_USERNAME" && test -n "$DOCKERHUB_TOKEN"
           # Secrets never appear on the command line or in the image layer.
-          printf '%s' "$DOCKERHUB_TOKEN" | buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
-          trap 'buildah logout docker.io >/dev/null 2>&1 || :' EXIT
+          printf '%s' "$DOCKERHUB_TOKEN" | sudo buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          trap 'sudo buildah logout docker.io >/dev/null 2>&1 || :' EXIT
           target="docker.io/$DOCKERHUB_REPOSITORY:v1.34.12-containerd2.4.1-$TARGET_ARCH"
-          buildah push "$LOCAL_IMAGE" "docker://$target"
+          sudo buildah push "$LOCAL_IMAGE" "docker://$target"
           echo "Pushed $target"
