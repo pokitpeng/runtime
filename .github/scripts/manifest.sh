@@ -6,6 +6,7 @@ readonly ERR_CODE=127
 
 readonly CRI_TYPE=${criType?}
 readonly KUBE_TYPE=${kubeType:-k8s}
+readonly CONTAINERD_VERSION=${CONTAINERD_VERSION:-1}
 
 readonly IMAGE_HUB_REGISTRY=${registry?}
 readonly IMAGE_HUB_REPO=${repo?}
@@ -42,7 +43,7 @@ if [[ "${kube_major//./}" -ge 126 ]]; then
   MOUNT_CRI=$(sudo buildah mount "$FROM_CRI")
   case $CRI_TYPE in
   containerd)
-    if ! [[ "$(sudo cat "$MOUNT_CRI"/cri/.versions | grep CONTAINERD | awk -F= '{print $NF}')" =~ v1\.([6-9]|[0-9][0-9])\.[0-9]+ ]]; then
+    if [[ "$CONTAINERD_VERSION" != 2.4.1 ]] && ! [[ "$(sudo cat "$MOUNT_CRI"/cri/.versions | grep CONTAINERD | awk -F= '{print $NF}')" =~ v1\.([6-9]|[0-9][0-9])\.[0-9]+ ]]; then
       echo https://kubernetes.io/blog/2022/11/18/upcoming-changes-in-kubernetes-1-26/#cri-api-removal
       exit
     fi
@@ -104,6 +105,14 @@ else
       "$IMAGE_HUB_REGISTRY/$IMAGE_HUB_REPO/$IMAGE_KUBE:v${KUBE%+*}-$SEALOS"
     )
   fi
+fi
+
+if [[ "$CRI_TYPE" == containerd && "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+  # Match kubernetes.sh's experimental, non-overwriting per-architecture tags.
+  IMAGE_TAGS=$(printf '%s\n' "$IMAGE_TAGS" | sed 's/-amd64/-amd64-containerd2.4.1/; s/-arm64/-arm64-containerd2.4.1/')
+  for i in "${!IMAGE_PUSH_NAME[@]}"; do
+    IMAGE_PUSH_NAME[$i]="${IMAGE_PUSH_NAME[$i]}-containerd2.4.1"
+  done
 fi
 
 sudo buildah login -u "$IMAGE_HUB_USERNAME" -p "$IMAGE_HUB_PASSWORD" "$IMAGE_HUB_REGISTRY"

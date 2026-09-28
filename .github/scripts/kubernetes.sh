@@ -27,6 +27,28 @@ readonly IMAGE_HUB_REPO=${repo?}
 readonly IMAGE_HUB_USERNAME=${username?}
 readonly IMAGE_HUB_PASSWORD=${password?}
 readonly IMAGE_CACHE_NAME="ghcr.io/labring-actions/cache"
+readonly CONTAINERD_VERSION="${CONTAINERD_VERSION:-1}"
+KUBE_CACHE_VERSION="${KUBE%+*}"
+if [[ "$CRI_TYPE" == containerd ]]; then
+  case "$CONTAINERD_VERSION" in
+    1|2.4.1) ;;
+    *) echo "Unsupported containerd version: $CONTAINERD_VERSION" >&2; exit 1 ;;
+  esac
+  if [[ "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+    if [[ ! "$KUBE" =~ ^1\.(34|35|36|37)\.[0-9]+$ ]]; then
+      echo "containerd 2.4.1: Kubernetes $KUBE is outside the candidate 1.34-1.37 matrix" >&2
+      exit 1
+    fi
+    if [[ "$KUBE_XY" == 1.37 ]]; then
+      echo "Kubernetes 1.37 cache base and cri-v1.37 are unavailable; build and pin both before enabling this minor" >&2
+      exit 1
+    fi
+    # Use the .0 base only for cached image layers; stage checked patch-level
+    # binaries and an updated kubeadm image list into our new rootfs layer.
+    KUBE_CACHE_VERSION="$KUBE_XY.0"
+  fi
+fi
+readonly KUBE_CACHE_VERSION
 
 ROOT="/tmp/$(whoami)/build"
 PATCH="/tmp/$(whoami)/patch"
@@ -54,7 +76,14 @@ if [[ "${KUBE_XY//./}" -ge 126 ]] && [[ "${SEALOS_XYZ//./}" -le 413 ]] && [[ -z 
 fi
 
 # image-cri-shim sealctl
-if [[ -n "$SEALOS_PATCH" ]]; then
+if [[ -n "${SEALOS_LOCAL_BIN_DIR:-}" ]]; then
+  for file in sealos sealctl image-cri-shim; do
+    test -x "$SEALOS_LOCAL_BIN_DIR/$file" || { echo "missing $file in SEALOS_LOCAL_BIN_DIR" >&2; exit 1; }
+  done
+  sudo install -m 0755 "$SEALOS_LOCAL_BIN_DIR/sealos" /usr/bin/sealos
+  sudo cp -a "$SEALOS_LOCAL_BIN_DIR/sealctl" opt/
+  sudo cp -a "$SEALOS_LOCAL_BIN_DIR/image-cri-shim" cri/
+elif [[ -n "$SEALOS_PATCH" ]]; then
   rmdir "$PATCH"
   sudo docker run --rm -v "/usr/bin:/pwd" --entrypoint /bin/sh ghcr.io/labring/sealos:latest -c "cp -a /usr/bin/sealos /pwd"
   sudo cp -au "$(sudo buildah mount "$(sudo buildah from "$SEALOS_PATCH-$ARCH")")" "$PATCH"
@@ -70,10 +99,13 @@ fi
 sudo sealos version
 
 # crictl helm kubeadm,kubectl,kubelet conntrack registry and cri(kubelet)
-MOUNT_KUBE=$(sudo buildah mount "$(sudo buildah from "$IMAGE_CACHE_NAME:kubernetes-v${KUBE%+*}-$ARCH")")
+MOUNT_KUBE=$(sudo buildah mount "$(sudo buildah from "$IMAGE_CACHE_NAME:kubernetes-v$KUBE_CACHE_VERSION-$ARCH")")
 MOUNT_CRIO=$(sudo buildah mount "$(sudo buildah from "$IMAGE_CACHE_NAME:cri-v$KUBE_XY-$ARCH")")
 MOUNT_TOOLS=$(sudo buildah mount "$(sudo buildah from "$IMAGE_CACHE_NAME:tools-$ARCH")")
 sudo tar -xzf "$MOUNT_CRIO"/cri/crictl.tar.gz -C bin/
+if [[ "$CRI_TYPE" == containerd && "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+  bash "$OLDPWD/.github/scripts/prepare-kubernetes-binaries.sh" "$KUBE" "$ARCH" "$ROOT"
+fi
 #sudo cp -au "$MOUNT_KUBE"/bin/{kubeadm,kubectl,kubelet} bin/
 sudo cp -au "$MOUNT_CRI"/cri/conntrack bin/
 sudo cp -au "$MOUNT_CRI"/cri/lsof opt/
@@ -86,6 +118,15 @@ containerd)
   fi
   IMAGE_KUBE=kubernetes
   sudo cp -au "$MOUNT_CRI"/cri/cri-containerd.tar.gz cri/
+  if [[ "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+    # The legacy cache image is still used for runc/crun and other tools.
+    sudo chown "$(id -u):$(id -g)" cri/cri-containerd.tar.gz
+    bash "$OLDPWD/.github/scripts/prepare-containerd-v2.sh" "$ARCH" cri/cri-containerd.tar.gz
+    cp -a etc/config-v4.toml.tmpl etc/config.toml.tmpl
+    rm etc/config-v4.toml.tmpl
+  else
+    rm etc/config-v4.toml.tmpl
+  fi
   ;;
 cri-o)
   if [[ "${SEALOS_XYZ%%.*}" -ge 5 ]] && ! [[ "${KUBE_XY//./}" -ge 124 ]]; then
@@ -144,6 +185,13 @@ else
   )
 fi
 
+# Experimental v2 images must not overwrite the legacy Kubernetes tags.
+if [[ "$CRI_TYPE" == containerd && "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+  for i in "${!IMAGE_PUSH_NAME[@]}"; do
+    IMAGE_PUSH_NAME[$i]="${IMAGE_PUSH_NAME[$i]}-containerd2.4.1"
+  done
+fi
+
 ### Sealed ###
 sudo chown -R "$(whoami)" "$ROOT"
 ### Sealed ###
@@ -158,7 +206,11 @@ else
 fi
 
 # update Kubefile
-pauseImage=$(sudo grep /pause: "$MOUNT_KUBE/images/shim/DefaultImageList")
+if [[ "$CRI_TYPE" == containerd && "$CONTAINERD_VERSION" == 2.4.1 ]]; then
+  pauseImage=$(grep /pause: images/shim/DefaultImageList)
+else
+  pauseImage=$(sudo grep /pause: "$MOUNT_KUBE/images/shim/DefaultImageList")
+fi
 if grep k3s <<<"$KUBE"; then
   rm -fv bin/crictl bin/conntrack cri/cri-containerd.tar.gz cri/libseccomp.tar.gz opt/lsof
   case $ARCH in
@@ -174,7 +226,7 @@ if grep k3s <<<"$KUBE"; then
   curl -fsSL "https://github.com/k3s-io/k3s/releases/download/v$KUBE/k3s-images.txt" | sed "/pause:/d" >images/shim/DefaultImageList
   echo "$pauseImage" >>images/shim/DefaultImageList
 else
-  sed -E "s#^FROM .+#FROM $IMAGE_CACHE_NAME:kubernetes-v${KUBE%+*}-$ARCH#" Kubefile >"Kubefile.$(uname)"
+  sed -E "s#^FROM .+#FROM $IMAGE_CACHE_NAME:kubernetes-v$KUBE_CACHE_VERSION-$ARCH#" Kubefile >"Kubefile.$(uname)"
   mv -fv "Kubefile.$(uname)" Kubefile
 fi
 
@@ -196,6 +248,12 @@ defaultVIP=10.103.97.2
 sandboxImage=${pauseImage#*/}
 EOF
 ) -t "$IMAGE_BUILD" --platform "linux/$ARCH" .
+
+# Test-only local build: no cluster changes or registry pushes.
+if [[ "${SEALOS_TEST_BUILD_ONLY:-}" == 1 ]]; then
+  echo "SEALOS_TEST_BUILD_IMAGE=$IMAGE_BUILD"
+  exit 0
+fi
 
 # debug for sealos run with amd64
 if [[ amd64 == "$ARCH" ]]; then

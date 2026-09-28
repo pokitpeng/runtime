@@ -1,0 +1,136 @@
+name: Build Kubernetes 1.34.12 with containerd 2.4.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Push the validated architecture-specific tags to Docker Hub'
+        type: boolean
+        default: false
+        required: true
+  push:
+    branches: [feat/containerd-v2]
+    paths:
+      - '.github/scripts/kubernetes.sh'
+      - '.github/scripts/prepare-kubernetes-binaries.sh'
+      - '.github/scripts/prepare-containerd-v2.sh'
+      - '.github/workflows/build-kubernetes-134-containerd2.yml'
+      - 'containerd/**'
+      - 'k8s/**'
+      - 'registry/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The base image, Go dependencies and embedded OCI images need >30 GiB
+    # free disk. An x86_64 runner cross-builds the arm64 image; no arm64 code
+    # is executed on the runner. Configure this label on a dedicated runner.
+    runs-on: [self-hosted, linux, x64, sealos-build]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    concurrency:
+      group: containerd2-134-${{ matrix.arch }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout runtime fork
+        uses: actions/checkout@v4
+        with:
+          path: runtime
+      - name: Checkout matching Sealos fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/sealos
+          ref: feat/containerd-v2
+          path: sealos
+          persist-credentials: false
+      - name: Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sealos/lifecycle/go.mod
+          cache-dependency-path: sealos/lifecycle/go.sum
+      - name: Check build host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          for tool in buildah tree file curl sha256sum tar; do command -v "$tool"; done
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$free_kib" -ge 31457280 || { echo 'At least 30 GiB free disk is required' >&2; exit 1; }
+      - name: Build Sealos binaries from this fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sealos-bin"
+          cd sealos/lifecycle
+          for binary in sealos sealctl image-cri-shim; do
+            go build -o "$RUNNER_TEMP/sealos-bin/$binary" "./cmd/$binary"
+          done
+          (cd staging/src/github.com/labring/image-cri-shim && go test ./pkg/cri -count=1)
+      - name: Build local architecture image (never pushes in this step)
+        id: image
+        shell: bash
+        env:
+          arch: ${{ matrix.arch }}
+          criType: containerd
+          kubeVersion: v1.34.12
+          sealoslatest: 5.1.1
+          registry: localhost
+          repo: sealos-test
+          username: unused
+          password: unused
+          CONTAINERD_VERSION: 2.4.1
+          SEALOS_TEST_BUILD_ONLY: '1'
+          SEALOS_LOCAL_BIN_DIR: ${{ runner.temp }}/sealos-bin
+        run: |
+          set -euo pipefail
+          cd runtime
+          bash .github/scripts/kubernetes.sh 2>&1 | tee "$RUNNER_TEMP/image-build.log"
+          image=$(grep -o 'SEALOS_TEST_BUILD_IMAGE=.*' "$RUNNER_TEMP/image-build.log" | tail -1 | cut -d= -f2-)
+          test -n "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+      - name: Check packaged binaries and configuration
+        shell: bash
+        env:
+          LOCAL_IMAGE: ${{ steps.image.outputs.image }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          container=$(buildah from "$LOCAL_IMAGE")
+          trap 'buildah umount "$container" >/dev/null 2>&1 || :; buildah rm "$container" >/dev/null 2>&1 || :' EXIT
+          mnt=$(buildah mount "$container")
+          grep -qx 'version = 4' "$mnt/etc/config.toml.tmpl"
+          grep -q 'registry.k8s.io/pause:3.10.1' "$mnt/images/shim/DefaultImageList"
+          test -x "$mnt/opt/sealctl" && test -x "$mnt/cri/image-cri-shim"
+          tar -xOzf "$mnt/cri/cri-containerd.tar.gz" usr/bin/containerd > "$RUNNER_TEMP/target-containerd"
+          if [[ "$TARGET_ARCH" == amd64 ]]; then
+            chmod +x "$RUNNER_TEMP/target-containerd"
+            "$RUNNER_TEMP/target-containerd" --version | grep -F 'v2.4.1'
+            test "$("$mnt/bin/kubeadm" version -o short)" = v1.34.12
+            test "$("$mnt/bin/kubelet" --version)" = 'Kubernetes v1.34.12'
+          else
+            file "$RUNNER_TEMP/target-containerd" "$mnt/bin/kubeadm" | grep -c 'ARM aarch64' | grep -qx 2
+          fi
+      - name: Push architecture tag to Docker Hub (explicit opt-in only)
+        if: github.event_name == 'workflow_dispatch' && inputs.publish == true
+        shell: bash
+        env:
+          LOCAL_IMAGE: ${{ steps.image.outputs.image }}
+          TARGET_ARCH: ${{ matrix.arch }}
+          DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$DOCKERHUB_REPOSITORY" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]]
+          test -n "$DOCKERHUB_USERNAME" && test -n "$DOCKERHUB_TOKEN"
+          # Secrets never appear on the command line or in the image layer.
+          printf '%s' "$DOCKERHUB_TOKEN" | buildah login --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          trap 'buildah logout docker.io >/dev/null 2>&1 || :' EXIT
+          target="docker.io/$DOCKERHUB_REPOSITORY:v1.34.12-containerd2.4.1-$TARGET_ARCH"
+          buildah push "$LOCAL_IMAGE" "docker://$target"
+          echo "Pushed $target"

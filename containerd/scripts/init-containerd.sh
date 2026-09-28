@@ -33,7 +33,20 @@ chmod a+x $(tar -tf ../cri/cri-containerd.tar.gz | while read -r binary; do echo
 systemctl enable containerd.service
 cp ../etc/config.toml /etc/containerd
 mkdir -p /etc/containerd/certs.d/$registry_domain:$registry_port
-cp ../etc/hosts.toml /etc/containerd/certs.d/$registry_domain:$registry_port
+host_file="/etc/containerd/certs.d/$registry_domain:$registry_port/hosts.toml"
+cp ../etc/hosts.toml "$host_file"
+# In containerd 2.x the old CRI registry.configs auth is not used. The pause
+# image is pulled by containerd itself (without image-cri-shim credentials).
+# Generate this host-scoped header only on the node; never bake it into the image.
+if grep -q '^version = 4$' ../etc/config.toml; then
+  : "${registryUsername:?registry username required for containerd 2.x}"
+  : "${registryPassword:?registry password required for containerd 2.x}"
+  auth=$(printf '%s' "$registryUsername:$registryPassword" | base64 | tr -d '\n')
+  printf '\n[host."http://%s:%s".header]\n  Authorization = ["Basic %s"]\n' \
+    "$registry_domain" "$registry_port" "$auth" >>"$host_file"
+  chmod 0600 "$host_file"
+  unset auth
+fi
 systemctl daemon-reload
 systemctl restart containerd.service
 check_status containerd

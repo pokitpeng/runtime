@@ -1,0 +1,33 @@
+version = 4
+root = "{{ .criData }}"
+state = "/run/containerd"
+oom_score = 0
+
+[plugins."io.containerd.server.v1.grpc"]
+  address = "/run/containerd/containerd.sock"
+  max_recv_message_size = 16777216
+  max_send_message_size = 16777216
+
+[plugins."io.containerd.cri.v1.images"]
+  snapshotter = "overlayfs"
+  max_concurrent_downloads = 20
+  use_local_image_pull = true
+  [plugins."io.containerd.cri.v1.images".pinned_images]
+    sandbox = "{{ .registryDomain }}:{{ .registryPort }}/{{ .sandboxImage }}"
+  [plugins."io.containerd.cri.v1.images".registry]
+    config_path = "/etc/containerd/certs.d"
+
+[plugins."io.containerd.cri.v1.runtime"]
+  max_container_log_line_size = 16384
+  disable_apparmor = {{ .disableApparmor }}
+  [plugins."io.containerd.cri.v1.runtime".containerd]
+    default_runtime_name = "runc"
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
+        SystemdCgroup = true
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.crun]
+      runtime_type = "io.containerd.runc.v2"
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.crun.options]
+        BinaryName = "/usr/bin/crun"
+        SystemdCgroup = true
